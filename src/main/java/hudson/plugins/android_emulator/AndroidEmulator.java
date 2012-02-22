@@ -41,6 +41,7 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -253,6 +254,61 @@ public class AndroidEmulator extends BuildWrapper implements Serializable {
         return doSetUp(build, launcher, listener, androidSdk, emuConfig, expandedProperties);
     }
 
+    /** Maximum number of tries to allocate a port. */
+    private static final int MAX_TRIES = 100;
+
+    /**
+     * Allocate a continuous range of ports within specified limits.
+     * The caller is responsible for freeing the individual ports within
+     * the allocated range.
+     * @param portAllocator
+     * @param build the current build
+     * @param start the first in the range of allowable ports
+     * @param end the last entry in the range of allowable ports
+     * @param count the number of ports to allocate
+     * @return the base port allocated
+     * @throws InterruptedException if the allocation was interrupted
+     * @throws IOException if the allocation failed
+     */
+    private int allocateConsecutivePortRange(
+            PortAllocationManager portAllocator,
+            final AbstractBuild<?, ?> build,
+            int start, int end, int count)
+    throws InterruptedException, IOException {
+        boolean allocationFailed = true;
+        Random rnd = new Random();
+        int firstPort = -1;
+
+        // Attempt the allocation a few times.
+        for (int i = 0; (allocationFailed && (i < MAX_TRIES)); i++) {
+            allocationFailed = false;
+
+            firstPort = rnd.nextInt((end - start) - count) + start;
+
+            // Allocate all of the ports in the range
+            for (int offset = 0; offset < count; offset++) {
+
+                final int allocPort = portAllocator.allocateRandom(build, firstPort + offset);
+
+                if (allocPort != (firstPort + offset)) {
+                    // Did not get requested port
+                    allocationFailed = true;
+                    // Free off allocated ports ready to try again
+                    portAllocator.free(allocPort);
+                    for (int freeOffset = offset - 1; freeOffset >= 0; freeOffset--) {
+                        portAllocator.free(firstPort + freeOffset);
+                    }
+                    // Try again from the beginning.
+                    break;
+                }
+            }
+        }
+        if (allocationFailed) {
+            throw new IOException("Failed to allocate port range");
+        }
+        return firstPort;
+    }
+
     @SuppressWarnings("hiding")
     private Environment doSetUp(final AbstractBuild<?, ?> build, final Launcher launcher,
             final BuildListener listener, final AndroidSdk androidSdk,
@@ -290,11 +346,11 @@ public class AndroidEmulator extends BuildWrapper implements Serializable {
             Thread.sleep(delaySecs * 1000);
         }
 
-        // Use the Port Allocator plugin to reserve the two ports we need
+        // Use the Port Allocator plugin to reserve the ports we need
         final PortAllocationManager portAllocator = PortAllocationManager.getManager(computer);
-        final int userPort = portAllocator.allocateRandom(build, 0);
-        final int adbPort = portAllocator.allocateRandom(build, 0);
-        final int adbServerPort = portAllocator.allocateRandom(build, 0);
+        final int userPort = allocateConsecutivePortRange(portAllocator, build, 1024, 9999, 3);
+        final int adbPort = userPort + 1;
+        final int adbServerPort = adbPort + 1;
 
         // Prepare to capture and log emulator standard output
         ByteArrayOutputStream emulatorOutput = new ByteArrayOutputStream();
@@ -375,7 +431,7 @@ public class AndroidEmulator extends BuildWrapper implements Serializable {
         boolean ignoreProcess = !launcher.isUnix() && androidSdk.getSdkToolsVersion() >= 12;
 
         // Notify adb of our existence
-        final String serial = "localhost:"+ adbPort;
+        final String serial = "emulator-"+ userPort;
         ArgumentListBuilder adbConnectCmd = Utils.getToolCommand(androidSdk, isUnix, Tool.ADB, "connect " + serial);
         int result = procStarter.cmds(adbConnectCmd).stdout(new NullStream()).start().join();
         if (result != 0) { // adb currently only ever returns 0!
@@ -527,7 +583,7 @@ public class AndroidEmulator extends BuildWrapper implements Serializable {
     private static void connectEmulator(PrintStream logger, AndroidSdk androidSdk, Launcher launcher,
                                         int adbPort, int userPort, int adbServerPort)
             throws IOException, InterruptedException {
-        final String serial = "localhost:"+ adbPort;
+        final String serial = "emulator-"+ userPort;
 
         final ProcStarter procStarter = launcher.launch().stderr(logger).envs("ANDROID_ADB_SERVER_PORT=" + adbServerPort);
         ArgumentListBuilder adbConnectCmd = Utils.getToolCommand(androidSdk, launcher.isUnix(), Tool.ADB, "connect " + serial);
@@ -537,7 +593,7 @@ public class AndroidEmulator extends BuildWrapper implements Serializable {
     private static void disconnectEmulator(PrintStream logger, AndroidSdk androidSdk, Launcher launcher,
                                            int adbPort, int userPort, int adbServerPort)
             throws IOException, InterruptedException {
-        final String args = "disconnect localhost:"+ adbPort;
+        final String args = "disconnect emulator-"+ userPort;
         ArgumentListBuilder adbDisconnectCmd = Utils.getToolCommand(androidSdk, launcher.isUnix(), Tool.ADB, args);
         final ProcStarter procStarter = launcher.launch().stderr(logger).envs("ANDROID_ADB_SERVER_PORT=" + adbServerPort);
         procStarter.cmds(adbDisconnectCmd).stdout(new NullStream()).start().joinWithTimeout(5L, TimeUnit.SECONDS, launcher.getListener());
